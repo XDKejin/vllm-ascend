@@ -128,12 +128,184 @@ def test_query_plan_rejects_layout_changes_on_reload(change):
     torch.testing.assert_close(query, expected)
 
 
-def test_modes_preserve_native_default_and_reject_typos():
-    assert backend.resolve_attn_res_mode(SimpleNamespace()) == "fused"
-    for mode in ("native", "fused", "two_phase", "original"):
-        assert backend.resolve_attn_res_mode(SimpleNamespace(attn_res_mode=mode)) == mode
+def test_modes_default_to_two_phase_and_reject_typos():
+    assert backend.resolve_attn_res_mode(SimpleNamespace()) == "two_phase"
+    assert backend.resolve_attn_res_mode(SimpleNamespace(), fused_available=True) == "fused"
+    for mode in ("native", "two_phase", "original"):
+        for available in (False, True):
+            assert backend.resolve_attn_res_mode(SimpleNamespace(attn_res_mode=mode), available) == mode
+    assert backend.resolve_attn_res_mode(SimpleNamespace(attn_res_mode="fused")) == "two_phase"
     with pytest.raises(ValueError, match="attn_res_mode"):
         backend.resolve_attn_res_mode(SimpleNamespace(attn_res_mode="typo"))
+
+
+@pytest.mark.parametrize("missing", ["module", "prepare", "update", None])
+@pytest.mark.parametrize("with_norm", [False, True])
+def test_optional_fused_operator_imports(monkeypatch, missing, with_norm):
+    ops = SimpleNamespace(block_attn_res_prepare=MagicMock(), block_attn_res_update=MagicMock())
+    norm_ops = SimpleNamespace(block_attn_res_update_rms_norm_op=MagicMock())
+    if missing in ("prepare", "update"):
+        delattr(ops, f"block_attn_res_{missing}")
+
+    def importer(name):
+        if name == "cann_ops_transformer.ops" and missing != "module":
+            return ops
+        if name == "ops.block_attn_res_update_rms_norm" and with_norm:
+            return norm_ops
+        raise ImportError(name)
+
+    monkeypatch.setitem(backend.load_attn_res_fused_ops.__globals__, "import_module", importer)
+    result = backend.load_attn_res_fused_ops()
+    if missing is not None:
+        assert result is None
+    else:
+        assert result.prepare is ops.block_attn_res_prepare
+        assert result.update is ops.block_attn_res_update
+        assert result.update_rms_norm is (norm_ops.block_attn_res_update_rms_norm_op if with_norm else None)
+
+
+def test_registered_prepare_is_used_for_graph_capture(monkeypatch):
+    registered = MagicMock()
+    monkeypatch.setattr(torch.ops.cann_ops_transformer, "block_attn_res_prepare", registered, raising=False)
+    ops = SimpleNamespace(block_attn_res_prepare=MagicMock(), block_attn_res_update=MagicMock())
+
+    def importer(name):
+        if name == "cann_ops_transformer.ops":
+            return ops
+        raise ImportError(name)
+
+    monkeypatch.setitem(backend.load_attn_res_fused_ops.__globals__, "import_module", importer)
+    assert backend.load_attn_res_fused_ops().prepare is registered
+
+
+@pytest.fixture
+def fused_ops():
+    def prepare(values, count, queries, eps):
+        assert values.dtype == torch.float32 and values.is_contiguous()
+        assert count.dtype == torch.uint64 and count.tolist() == [values.shape[1]]
+        return backend.prepare_attn_res_phase1(values, queries, eps)
+
+    def update(partial, delta, query, numerator, maximum, exp_sum, eps):
+        assert partial.dtype == torch.float32
+        partial.add_(delta.float())
+        return reference_output(partial, query, numerator, maximum, exp_sum, eps).to(delta.dtype)
+
+    def reference_output(partial, query, numerator, maximum, exp_sum, eps):
+        stats = backend.AttnResPhase1Stats(numerator, maximum, exp_sum)
+        return backend.merge_attn_res_partial(partial, query, stats, eps)
+
+    def update_norm(partial, delta, query, numerator, maximum, exp_sum, gamma, eps, norm_eps):
+        value = update(partial, delta, query, numerator, maximum, exp_sum, eps).float()
+        return (value * torch.rsqrt(value.square().mean(-1, keepdim=True) + norm_eps) * gamma).to(delta.dtype)
+
+    return backend.AttnResFusedOps(
+        MagicMock(side_effect=prepare), MagicMock(side_effect=update), MagicMock(side_effect=update_norm)
+    )
+
+
+@pytest.mark.parametrize("with_norm", [False, True])
+@pytest.mark.parametrize("capture", [False, True])
+@pytest.mark.parametrize("tuple_output", [False, True])
+def test_fused_dispatch_preserves_partial_and_dspark_contract(fused_ops, with_norm, capture, tuple_output):
+    projection = SimpleNamespace(weight=torch.ones(1, 4))
+    norm = SimpleNamespace(weight=torch.ones(4), variance_epsilon=1e-6)
+    specs = [(projection, norm, 1)] * 2
+    if not with_norm:
+        fused_ops = fused_ops._replace(update_rms_norm=None)
+    if tuple_output:
+        update = fused_ops.update
+        fused_ops = fused_ops._replace(update=lambda *args, **kwargs: (update(*args, **kwargs), args[0]))
+    op = backend.AttnResBackend("fused", backend.AttnResQueryPlan(specs), fused_ops)
+    prefix = torch.full((2, 4), 256.0, dtype=torch.bfloat16)
+    delta = torch.ones_like(prefix)
+    bank = torch.zeros(2, 1, 4, dtype=torch.bfloat16)
+    snapshots = []
+    for _ in range(2):
+        output, raw, materialized = op(
+            prefix,
+            delta,
+            bank,
+            projection.weight,
+            norm.weight,
+            1e-6,
+            1,
+            output_norm_weight=norm.weight,
+            output_norm_eps=1e-4,
+            return_materialized=capture,
+        )
+        snapshots.append(raw.clone())
+        if capture:
+            value = materialized.float()
+            expected = (value * torch.rsqrt(value.square().mean(-1, keepdim=True) + 1e-4)).to(output.dtype)
+            torch.testing.assert_close(output, expected)
+        else:
+            assert materialized is output
+    assert fused_ops.prepare.call_count == 1
+    assert op.partial.dtype == torch.float32 and torch.equal(op.partial, prefix.float() + 2)
+    torch.testing.assert_close(snapshots[0], prefix)
+    torch.testing.assert_close(raw, (prefix.float() + 2).bfloat16())
+    assert torch.equal(op.finish_partial(raw, delta), (prefix.float() + 3).bfloat16())
+    if with_norm:
+        assert fused_ops.update_rms_norm.call_count == (0 if capture else 2)
+
+
+def test_fused_runtime_error_does_not_silently_change_backend(fused_ops):
+    projection = SimpleNamespace(weight=torch.ones(1, 4))
+    norm = SimpleNamespace(weight=torch.ones(4), variance_epsilon=1e-6)
+    fused_ops.update.side_effect = RuntimeError("operator version mismatch")
+    op = backend.AttnResBackend("fused", backend.AttnResQueryPlan([(projection, norm, 1)]), fused_ops)
+    with pytest.raises(RuntimeError, match="operator version mismatch"):
+        op(torch.ones(2, 4), None, torch.zeros(2, 1, 4), projection.weight, norm.weight, 1e-6, 1)
+
+
+def test_fused_flag_defaults_to_enabled_and_can_disable(monkeypatch):
+    env_namespace = runpy.run_path(str(ROOT / "vllm_ascend/envs.py"))
+    name = "VLLM_ASCEND_KIMI_K3_ATTNRES_FUSED_ENABLED"
+    monkeypatch.delenv(name, raising=False)
+    assert env_namespace["env_variables"][name]() is True
+    monkeypatch.setenv(name, "0")
+    assert env_namespace["env_variables"][name]() is False
+
+
+def test_fused_dispatch_is_capturable_without_python_fallback(fused_ops):
+    def prepare(values, count, queries, eps):
+        return backend.prepare_attn_res_phase1(values, queries, eps)
+
+    # Replace only the optional NPU kernels with traceable Torch functions;
+    # all adapter state, FP32 accumulation and output normalization stay real.
+    ops = backend.AttnResFusedOps(prepare, fused_ops.update.side_effect, fused_ops.update_rms_norm.side_effect)
+    projection = SimpleNamespace(weight=torch.ones(1, 4))
+    norm = SimpleNamespace(weight=torch.ones(4), variance_epsilon=1e-6)
+    plan = backend.AttnResQueryPlan([(projection, norm, 1)] * 2)
+
+    def forward(prefix, delta, bank):
+        op = backend.AttnResBackend("fused", plan, ops)
+        output, raw, _ = op(
+            prefix,
+            delta,
+            bank,
+            projection.weight,
+            norm.weight,
+            1e-6,
+            1,
+            output_norm_weight=norm.weight,
+        )
+        return op(
+            raw,
+            output,
+            bank,
+            projection.weight,
+            norm.weight,
+            1e-6,
+            1,
+            output_norm_weight=norm.weight,
+        )[0]
+
+    compiled = torch.compile(forward, backend="eager", fullgraph=True)
+    for _ in range(2):
+        prefix, delta = torch.randn(2, 4).bfloat16(), torch.randn(2, 4).bfloat16()
+        bank = torch.randn(2, 1, 4).bfloat16()
+        torch.testing.assert_close(compiled(prefix, delta, bank), forward(prefix, delta, bank))
 
 
 def test_two_phase_forward_cache_supports_full_graph_capture():

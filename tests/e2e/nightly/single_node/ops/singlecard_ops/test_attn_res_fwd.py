@@ -7,7 +7,7 @@ import pytest
 import torch
 import torch_npu
 
-from vllm_ascend.ops.kimi_attn_res import AttnResBackend, AttnResQueryPlan
+from vllm_ascend.ops.kimi_attn_res import AttnResBackend, AttnResQueryPlan, load_attn_res_fused_ops
 
 
 def cpu_reference(prefix, addend, blocks, projection, gamma, valid, output_gamma, epsilon, mix):
@@ -155,3 +155,55 @@ def test_two_phase_graph_replay_observes_reloaded_queries():
         assert not torch.allclose(actual, before)
         assert_precision(actual, expected.cpu())
         before = actual
+
+
+@pytest.mark.parametrize("capture_materialized", [False, True])
+@torch.inference_mode()
+def test_fused_two_phase_operators_and_graph_replay(capture_materialized):
+    fused_ops = load_attn_res_fused_ops()
+    if fused_ops is None:
+        pytest.skip("Install transformer prepare/update operators to validate the fused backend")
+    hidden, tokens = 7168, 4
+    torch.manual_seed(63)
+    prefix = torch.randn(tokens, hidden, device="npu", dtype=torch.bfloat16)
+    delta = torch.randn_like(prefix)
+    bank = torch.randn(tokens, 2, hidden, device="npu", dtype=torch.bfloat16)
+    projection = SimpleNamespace(weight=(torch.randn(1, hidden, device="npu") / hidden**0.5).bfloat16())
+    norm = SimpleNamespace(weight=torch.ones(hidden, device="npu", dtype=torch.bfloat16), variance_epsilon=1e-6)
+    plan = AttnResQueryPlan([(projection, norm, 2)])
+
+    def forward():
+        op = AttnResBackend("fused", plan, fused_ops)
+        return op(
+            prefix,
+            delta,
+            bank,
+            projection.weight,
+            norm.weight,
+            norm.variance_epsilon,
+            2,
+            output_norm_weight=norm.weight,
+            output_norm_eps=norm.variance_epsilon,
+            return_materialized=capture_materialized,
+        )
+
+    # The fused source accumulates in FP32 before scoring. Use that partial
+    # in the independent reference, then round the mixture before RMSNorm.
+    values = torch.cat((bank.float().cpu(), (prefix.float() + delta.float()).cpu().unsqueeze(1)), dim=1)
+    query = projection.weight.float().cpu() * norm.weight.float().cpu()
+    logits = (values * query).sum(-1) * torch.rsqrt(values.square().mean(-1) + norm.variance_epsilon)
+    materialized = (logits.softmax(-1).unsqueeze(-1) * values).sum(1).bfloat16()
+    value = materialized.float()
+    expected = (value * torch.rsqrt(value.square().mean(-1, keepdim=True) + norm.variance_epsilon)).bfloat16()
+    eager, eager_raw, eager_materialized = forward()
+    assert_precision(eager, expected)
+    torch.testing.assert_close(eager_raw.cpu(), (prefix.float() + delta.float()).bfloat16().cpu(), atol=0, rtol=0)
+    if capture_materialized:
+        assert_precision(eager_materialized, materialized)
+    torch.npu.synchronize()
+    graph = torch.npu.NPUGraph()
+    with torch.npu.graph(graph):
+        replay_output = forward()[0]
+    for _ in range(2):
+        graph.replay()
+        assert_precision(replay_output, expected)

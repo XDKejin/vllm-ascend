@@ -23,6 +23,7 @@ from vllm.distributed import (
 )
 from vllm.distributed.parallel_state import model_parallel_is_initialized
 from vllm.forward_context import get_forward_context, is_forward_context_available
+from vllm.logger import logger
 from vllm.model_executor.layers.fused_moe import (
     FusedMoEFactory,
     fused_moe_make_expert_params_mapping,
@@ -85,10 +86,16 @@ from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.utils.math_utils import cdiv
 
+from vllm_ascend import envs as ascend_envs
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.attention.utils import mark_fused_preprocess_weights
 from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
-from vllm_ascend.ops.kimi_attn_res import AttnResBackend, AttnResQueryPlan, resolve_attn_res_mode
+from vllm_ascend.ops.kimi_attn_res import (
+    AttnResBackend,
+    AttnResQueryPlan,
+    load_attn_res_fused_ops,
+    resolve_attn_res_mode,
+)
 from vllm_ascend.ops.kimi_kda import (
     AscendKimiK3DeltaAttention as AscendKimiK3DeltaAttentionBase,
 )
@@ -862,9 +869,22 @@ class AscendKimiLinearModel(UpstreamKimiLinearModel):
         nn.Module.__init__(self)
         config = vllm_config.model_config.hf_text_config
         self.config = config
-        # Preserve the v0.30 native fusion by default; the imported algorithm
-        # and its single-pass reference are explicit comparison backends.
-        self.attn_res_mode = resolve_attn_res_mode(config)
+        self.attn_res_fused_ops = None
+        if (
+            config.attn_res_block_size is not None
+            and getattr(config, "attn_res_mode", "fused") == "fused"
+            and ascend_envs.VLLM_ASCEND_KIMI_K3_ATTNRES_FUSED_ENABLED
+        ):
+            self.attn_res_fused_ops = load_attn_res_fused_ops()
+        self.attn_res_mode = resolve_attn_res_mode(config, fused_available=self.attn_res_fused_ops is not None)
+        if config.attn_res_block_size is not None:
+            if getattr(config, "attn_res_mode", "fused") == "fused" and self.attn_res_mode == "two_phase":
+                logger.warning_once("Kimi K3 fused AttnRes unavailable or disabled; falling back to two_phase")
+            logger.info("Kimi K3 AttnRes mode: %s", self.attn_res_mode)
+            if self.attn_res_fused_ops is not None:
+                logger.info(
+                    "Kimi K3 AttnRes Update+RMSNorm fusion: %s", self.attn_res_fused_ops.update_rms_norm is not None
+                )
         self.attn_res_query_plan: AttnResQueryPlan | None = None
         self.vocab_size = config.vocab_size
         # Only the last PP stage loads the drafter. Select its aux contract
@@ -999,7 +1019,7 @@ class AscendKimiLinearModel(UpstreamKimiLinearModel):
         result = super().load_weights(
             load_eplb_expert_weights(self, remap_mixed_gate_weights(), self.n_redundant_experts)
         )
-        if self.config.attn_res_block_size is not None and self.attn_res_mode in ("two_phase", "original"):
+        if self.config.attn_res_block_size is not None and self.attn_res_mode != "native":
             self._prepare_attn_res_query_plan()
         return result
 
@@ -1093,11 +1113,11 @@ class AscendKimiLinearModel(UpstreamKimiLinearModel):
 
         optimize_attn_res_prefill = _use_attn_res_prefill_cache()
         attn_res_op = None
-        if getattr(self, "attn_res_mode", "fused") in ("two_phase", "original"):
+        if self.attn_res_mode != "native":
             if self.attn_res_query_plan is None:
                 # Dummy/model warmup may precede checkpoint loading.
                 self._prepare_attn_res_query_plan()
-            attn_res_op = AttnResBackend(self.attn_res_mode, self.attn_res_query_plan)
+            attn_res_op = AttnResBackend(self.attn_res_mode, self.attn_res_query_plan, self.attn_res_fused_ops)
         pending_mlp_output = None
         for layer_idx, layer in enumerate(
             self.layers[self.start_layer : self.end_layer],
@@ -1126,7 +1146,11 @@ class AscendKimiLinearModel(UpstreamKimiLinearModel):
             )
 
         if not get_pp_group().is_last_rank and pending_mlp_output is not None:
-            hidden_states = hidden_states + pending_mlp_output
+            hidden_states = (
+                attn_res_op.finish_partial(hidden_states, pending_mlp_output)
+                if self.attn_res_mode == "fused"
+                else hidden_states + pending_mlp_output
+            )
             if not materialized_aux:
                 # Publish the completed raw prefix at the PP boundary once.
                 self._maybe_add_hidden_state(aux_hidden_states, self.end_layer, hidden_states, None)
