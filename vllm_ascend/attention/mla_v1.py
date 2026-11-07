@@ -8,6 +8,7 @@ import torch
 import torch.nn.functional as F
 import torch_npu
 from vllm.config import VllmConfig, get_current_vllm_config
+from vllm.distributed import get_dcp_group
 from vllm.distributed.parallel_state import get_pcp_group
 from vllm.logger import logger
 from vllm.model_executor.layers.attention.mla_attention import (
@@ -1023,7 +1024,11 @@ class AscendMLAImpl(MLAAttentionImpl):
         self.use_mla_rope = kwargs.get("use_mla_rope", True)
         self.vllm_config = get_current_vllm_config()
         self.pcp_enabled = self.vllm_config.parallel_config.prefill_context_parallel_size > 1
-        self.dcp_enabled = self.vllm_config.parallel_config.decode_context_parallel_size > 1
+        # DCP group size and this rank's 0-based index. FlashMLA metadata takes
+        # them directly instead of deriving the local boundary in Python.
+        self.dcp_size = self.vllm_config.parallel_config.decode_context_parallel_size
+        self.dcp_rank = get_dcp_group().rank_in_group if self.dcp_size > 1 else 0
+        self.dcp_enabled = self.dcp_size > 1
         self.is_pcp_decode_sharded = is_pcp_decode_sharding_enabled(self.vllm_config)
         self.kv_a_proj_with_mqa = kwargs.get("kv_a_proj_with_mqa")
         self.kv_a_layernorm = kwargs.get("kv_a_layernorm")
@@ -1064,6 +1069,9 @@ class AscendMLAImpl(MLAAttentionImpl):
             return False
         if config.speculative_config is not None and config.speculative_config.method != "dspark":
             return False
+        # The unquantized FlashMLA contract: a supported Q head-group width,
+        # one KV head, a 576-dim fused QK head (512 nope + 64 rope), a 512-dim
+        # latent Value, unquantized BF16/FP16 KV and no external NZ conversion.
         if not get_current_hardware_profile().supports(HardwareCapability.MLA_FLASH):
             return False
         if self.num_heads not in MLA_FLASH_SUPPORTED_Q_HEADS or self.num_kv_heads != 1:
@@ -1073,11 +1081,21 @@ class AscendMLAImpl(MLAAttentionImpl):
         if self.fa_quant_layer or self.dtype not in (torch.bfloat16, torch.float16) or self.enable_kv_nz:
             return False
         dcp_size = config.parallel_config.decode_context_parallel_size
-        # History sees all Q heads in the DCP group; current uses local heads.
+        # Each rank attends its KV shard with all of its own Q heads, so the
+        # group width is what the operator must support under DCP.
         if self.pcp_enabled or self.num_heads * dcp_size not in MLA_FLASH_SUPPORTED_Q_HEADS:
             return False
+        # The metadata operator fixes the local interleave to the physical block
+        # size, so a paged layout with another interleave keeps the sparse path.
+        if dcp_size > 1 and getattr(
+            config.parallel_config, "cp_kv_cache_interleave_size", FLASHMLA_BLOCK_SIZE
+        ) != FLASHMLA_BLOCK_SIZE:
+            return False
+        # Raw PD transfers cannot carry the token-fused FlashMLA page, so they
+        # keep the component-major sparse path.
         if not supports_component_major_mla_pd(config) or enable_sfa(config):
             return False
+        # Without the unquantized FlashMLA pair the sparse op remains the fallback.
         return get_flashmla_ops() is not None
 
     @staticmethod
@@ -3098,9 +3116,10 @@ class AscendMLAImpl(MLAAttentionImpl):
         return_current_kv = self._decode_requires_current_kv(attn_metadata)
         scatter_history = return_current_kv or flash_mlapo
         if return_current_kv or (flash_mlapo and self.dcp_enabled):
-            # DCP attention needs every current row, while the paged cache keeps
-            # only this rank's history. Use the existing prolog cache outputs for
-            # the current chunk, then scatter its rank-owned rows to history.
+            # DCP current rows are staged outside the paged history cache, so take
+            # them from the existing prolog cache outputs and scatters this rank's
+            # own rows into the paged cache, which the single FlashMLA call then
+            # reads at the end of its local range.
             assert self._dcp_current_kv_buffers is not None
             current_nope_cache, current_pe_cache, current_indices = self._dcp_current_kv_buffers
             assert bsz <= current_indices.numel()

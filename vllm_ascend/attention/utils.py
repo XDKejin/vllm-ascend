@@ -41,9 +41,8 @@ from vllm_ascend.utils import (
 ATTENTION_UPDATE_MAX_INPUTS = 16
 SFA_QSFA_TILE_SIZE = 128
 MLAPO_MAX_SUPPORTED_TOKENS = 1024
-# FlashMLA's A5 kernel accepts these per-rank query-head counts (N1). Other
-# MLA models keep the FIA-compatible component-major cache layout on A5.
-# N1 is the post-TP local head count, not the global model configuration.
+# The paged FlashMLA cache is laid out for a fixed set of per-rank Q head-group
+# widths. Other MLA models keep the FIA-compatible component-major cache layout.
 MLA_FLASH_SUPPORTED_Q_HEADS = frozenset((8, 12, 64, 96))
 
 
