@@ -106,9 +106,7 @@ class FlashMLAConfig:
         # The operator's paged cache is laid out for a fixed set of Q head-group
         # widths; the selection gate and this check must agree on that set.
         if self.num_heads not in MLA_FLASH_SUPPORTED_Q_HEADS:
-            raise ValueError(
-                f"FlashMLA requires one of {MLA_FLASH_SUPPORTED_Q_HEADS} Q heads, got {self.num_heads}"
-            )
+            raise ValueError(f"FlashMLA requires one of {MLA_FLASH_SUPPORTED_Q_HEADS} Q heads, got {self.num_heads}")
         if self.mask_mode not in (0, 3, 4):
             raise ValueError("FlashMLA mask_mode must be 0, 3 or 4")
         if self.layout_kv != "PA_BBND":
@@ -125,7 +123,7 @@ class FlashMLAConfig:
             # physical block so the local slice matches the paged layout.
             if self.mask_mode != 0 or self.win_left != -1 or self.win_right != -1:
                 raise ValueError("FlashMLA DCP requires mask_mode=0 and unbounded windows")
-            if not 0 < self.cp_world:
+            if self.cp_world <= 0:
                 raise ValueError("FlashMLA DCP requires cp_world >= 1")
             if not 0 <= self.cp_rank < self.cp_world:
                 raise ValueError("FlashMLA cp_rank must be a 0-based value below cp_world")
@@ -348,9 +346,9 @@ class FlashMLAMetadataBuilder:
         dcp = self.dcp_size > 1
         adapter = FlashMLAImpl.load(
             FlashMLAConfig(
-                # Every rank owns all Q heads and attends only its KV shard; the
-                # inter-rank reduction merges the shards, not the heads.
-                impl.num_heads,
+                # Q is gathered across the DCP group before attending each KV
+                # shard. The output exchange restores this rank's local heads.
+                impl.num_heads * self.dcp_size,
                 impl.scale,
                 mask_mode=0 if dcp else 3,
                 # DCP produces only the local attention and local statistics; the
@@ -362,10 +360,13 @@ class FlashMLAMetadataBuilder:
                 cp_kv_cache_interleave_size=self.cp_interleave,
             )
         )
-        # DCP owns causality inside the metadata, so one adapter serves causal
-        # and non-causal requests; without DCP the non-causal path needs the
-        # unbounded mask.
-        noncausal_adapter = adapter if dcp else replace(adapter, config=replace(adapter.config, mask_mode=0))
+        # Noncausal queries attend the complete local shard without the
+        # operator's DCP causal boundary. Framework DCP still gathers heads
+        # and merges local outputs/LSE with the real group size.
+        noncausal_adapter = replace(
+            adapter,
+            config=replace(adapter.config, mask_mode=0, enable_dcp=False, cp_world=1, cp_rank=0),
+        )
         self.adapters = {True: adapter, False: noncausal_adapter}
         self.device = device
         self.dtype = impl.dtype
@@ -445,11 +446,11 @@ class FlashMLAMetadataBuilder:
                 flash.global_cache_lens.zero_()
             # One call covers the whole decode range, so the KV length keeps the
             # current rows; the metadata operator derives the causal boundary.
-            lengths = common.seq_lens[:num_decodes]
-            global_lengths = None
-            if flash.global_cache_lens is not None:
-                global_lengths = lengths
-                # This rank only holds its interleaved slice of the KV.
+            global_lengths = common.seq_lens[:num_decodes]
+            lengths = global_lengths
+            if self.dcp_size > 1:
+                # Both causal and noncausal attention read only this rank's
+                # shard, independently of the operator's causal mode.
                 lengths = get_dcp_local_seq_lens(
                     lengths,
                     dcp_size=self.dcp_size,
@@ -460,7 +461,7 @@ class FlashMLAMetadataBuilder:
                 lengths = lengths.clamp_min(0)
             flash.cache_lens[:num_decodes].copy_(lengths)
             flash.cache_lens.masked_fill_(flash.used_q == 0, 0)
-            if global_lengths is not None:
+            if flash.global_cache_lens is not None:
                 flash.global_cache_lens[:num_decodes].copy_(global_lengths)
                 flash.global_cache_lens.masked_fill_(flash.used_q == 0, 0)
             flash.block_table.zero_()
@@ -482,10 +483,9 @@ class FlashMLAMetadataBuilder:
                 cos, sin = get_cos_and_sin_mla(flash.positions)
                 flash.cos.copy_(cos)
                 flash.sin.copy_(sin)
+
             flash.schedule.copy_(
-                flash.adapter.build_metadata(
-                    flash.cache_lens, flash.cu, flash.used_q, flash.global_cache_lens
-                )
+                flash.adapter.build_metadata(flash.cache_lens, flash.cu, flash.used_q, flash.global_cache_lens)
             )
 
         # Refresh on the caller's stream before return; captured buffer caching
