@@ -71,7 +71,12 @@ def check_schedule(flash):
 
 
 def paged_attention(query, cache, **kwargs):
-    """CPU replacement for the external op, with its NTD/NT return contract."""
+    """CPU replacement for the custom op's TND output and NT LSE contract."""
+    assert kwargs["layout_q"] == "TND"
+    assert kwargs["layout_kv"] == "PA_BBND"
+    assert kwargs["layout_out"] == "TND"
+    if kwargs["mask_mode"] != 4:
+        assert "win_left" not in kwargs and "win_right" not in kwargs
     heads, tokens = query.shape[1], query.shape[0]
     output = torch.zeros(heads, tokens, 512, dtype=query.dtype)
     lse = torch.full((heads, tokens), torch.inf, dtype=torch.float32)
@@ -104,7 +109,7 @@ def paged_attention(query, cache, **kwargs):
             scores = query[token].double() @ visible_keys.T * kwargs["softmax_scale"]
             output[:, token] = (scores.softmax(-1) @ visible_keys[:, :512]).to(query.dtype)
             lse[:, token] = scores.logsumexp(-1).float()
-    return output, lse
+    return output.transpose(0, 1).contiguous(), lse
 
 
 def combine_outputs(recv, head_dim, *, scatter_dim, local_output=None, local_lse=None):
@@ -620,11 +625,54 @@ def test_external_dcp_graph_skips_fia_parameter_updates(draft):
 @pytest.mark.parametrize("bad_lse", ["layout", "dtype"])
 def test_dcp_rejects_incompatible_lse_contract(runtime, bad_lse):
     flash = runtime.builder().build(common([1], [1]), 1, 1, False)
-    output = torch.zeros(64, 1, 512, dtype=torch.float16)
+    output = torch.zeros(1, 64, 512, dtype=torch.float16)
     lse = torch.zeros(1, 64) if bad_lse == "layout" else torch.zeros(64, 1, dtype=torch.float16)
     runtime.attention_op.side_effect = None
     runtime.attention_op.return_value = output, lse
     with pytest.raises(ValueError, match="softmax_lse"):
+        flash.adapter.attention(
+            flash.query,
+            torch.zeros(1, 128, 1, 576, dtype=torch.float16),
+            block_table=flash.block_table,
+            cache_seqlens=flash.cache_lens,
+            cu_seqlens_q=flash.cu,
+            seqused_q=flash.used_q,
+            metadata=flash.schedule,
+        )
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("size,heads", [(1, 12), (8, 12)])
+def test_custom_output_layout_is_adapted_without_reordering_heads(runtime, dtype, size, heads):
+    flash = runtime.builder(size=size, heads=heads, dtype=dtype).build(common([3], [3]), 1, 3, False)
+    gathered_heads = heads * size
+    # T != H and distinct token/head values detect accidental double transposes.
+    output = torch.arange(3 * gathered_heads, dtype=torch.float32).reshape(3, gathered_heads, 1)
+    output = output.expand(-1, -1, 512).to(dtype).contiguous()
+    lse = torch.arange(gathered_heads * 3, dtype=torch.float32).reshape(gathered_heads, 3)
+    runtime.attention_op.side_effect = None
+    runtime.attention_op.return_value = output, lse
+    result, stats = flash.adapter.attention(
+        flash.query,
+        torch.zeros(1, 128, 1, 576, dtype=dtype),
+        block_table=flash.block_table,
+        cache_seqlens=flash.cache_lens,
+        cu_seqlens_q=flash.cu,
+        seqused_q=flash.used_q,
+        metadata=flash.schedule,
+        attn_mask=flash.attn_mask,
+    )
+    torch.testing.assert_close(result, output.transpose(0, 1))
+    assert result.data_ptr() == output.data_ptr()
+    assert stats is lse
+    assert runtime.attention_op.call_args.kwargs["layout_out"] == "TND"
+
+
+def test_custom_operator_rejects_old_output_layout(runtime):
+    flash = runtime.builder().build(common([3], [3]), 1, 3, False)
+    runtime.attention_op.side_effect = None
+    runtime.attention_op.return_value = torch.zeros(64, 3, 512, dtype=torch.float16), torch.zeros(64, 3)
+    with pytest.raises(ValueError, match="output requires shape"):
         flash.adapter.attention(
             flash.query,
             torch.zeros(1, 128, 1, 576, dtype=torch.float16),

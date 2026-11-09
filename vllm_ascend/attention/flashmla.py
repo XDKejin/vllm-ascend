@@ -3,7 +3,7 @@
 """External, unquantized FlashMLA implementation and metadata builder.
 
 Call FlashMLAImpl.load after selecting the worker device. Importing this module
-does not load cann_ops_transformer. FlashMLAImpl wraps the operator contract, while
+does not load cann_ops_transformer_custom. FlashMLAImpl wraps the operator contract, while
 FlashMLAMetadataBuilder owns per-batch inputs, stable buffers and per-build refreshes.
 Callers own stream ordering and persistent KV writes. Tensor-content checks belong
 in preflight tests: the decode hot path must not copy lengths or tables to the CPU.
@@ -177,8 +177,9 @@ class FlashMLAImpl:
         available_ops = get_flashmla_ops()
         if available_ops is None:
             raise RuntimeError(
-                "FlashMLA requires cann_ops_transformer.ops.flash_mla "
-                "and flash_mla_metadata. Install a package matching the worker's "
+                "FlashMLA requires cann_ops_transformer_custom to register "
+                "torch.ops.cann_ops_transformer.flash_mla and flash_mla_metadata. "
+                "Install a DCP-capable package matching the worker's "
                 "CANN and torch_npu versions."
             )
         attention_op, metadata_op = available_ops
@@ -203,6 +204,9 @@ class FlashMLAImpl:
         if not self.config.enable_dcp and casusal_seqlens_kv_global is not None:
             raise ValueError("FlashMLA non-DCP metadata forbids casusal_seqlens_kv_global")
         _check_lengths(cache_seqlens, cu_seqlens_q, seqused_q, casusal_seqlens_kv_global)
+        window_args = (
+            {"win_left": self.config.win_left, "win_right": self.config.win_right} if self.config.mask_mode == 4 else {}
+        )
         return self.metadata_op(
             cache_seqlens,
             num_heads_q=self.config.num_heads,
@@ -214,14 +218,13 @@ class FlashMLAImpl:
             head_dim_qk=FLASHMLA_QK_DIM,
             head_dim_v=FLASHMLA_V_DIM,
             mask_mode=self.config.mask_mode,
-            win_left=self.config.win_left,
-            win_right=self.config.win_right,
             layout_q="TND",
             enable_dcp=self.config.enable_dcp,
             cp_world=self.config.cp_world,
             cp_rank=self.config.cp_rank,
             cp_kv_cache_interleave_size=self.config.cp_kv_cache_interleave_size,
             casusal_seqlens_kv_global=casusal_seqlens_kv_global,
+            **window_args,
         )
 
     def attention(
@@ -236,12 +239,16 @@ class FlashMLAImpl:
         seqused_q: torch.Tensor | None = None,
         attn_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Consume caller-owned paged KV and return latent output in NTD order.
+        """Adapt the custom operator's TND output to the caller's NTD contract.
 
         Metadata must have been generated from these same lengths and this
         config. Regenerate it when lengths change, including graph replay.
+        The operator returns NT FP32 LSE even when layout_out is TND.
         """
         self._check_inputs(q, k_cache, block_table, cache_seqlens, cu_seqlens_q, metadata, seqused_q, attn_mask)
+        window_args = (
+            {"win_left": self.config.win_left, "win_right": self.config.win_right} if self.config.mask_mode == 4 else {}
+        )
         output, lse = self.attention_op(
             q,
             k_cache,
@@ -254,21 +261,19 @@ class FlashMLAImpl:
             head_dim_v=FLASHMLA_V_DIM,
             softmax_scale=self.config.softmax_scale,
             mask_mode=self.config.mask_mode,
-            win_left=self.config.win_left,
-            win_right=self.config.win_right,
             max_seqlen_q=-1,
             max_seqlen_kv=-1,
             layout_q="TND",
             layout_kv=self.config.layout_kv,
-            layout_out="NTD",
+            layout_out="TND",
             return_softmax_lse=self.config.return_softmax_lse,
+            **window_args,
         )
+        _check_tensor("output", output, (q.shape[0], self.config.num_heads, FLASHMLA_V_DIM), q.dtype)
         if self.config.return_softmax_lse:
-            # TND queries return NTD latent output and NT FP32 statistics.
-            # DCP must not guess an installed package's LSE layout or precision.
-            _check_tensor("output", output, (self.config.num_heads, q.shape[0], FLASHMLA_V_DIM), q.dtype)
+            # Output and LSE have different layouts in the reference API.
             _check_tensor("softmax_lse", lse, (self.config.num_heads, q.shape[0]), torch.float32)
-        return output, lse
+        return output.transpose(0, 1), lse
 
     def _check_inputs(
         self,
