@@ -26,6 +26,7 @@ if TYPE_CHECKING:
 FLASHMLA_QK_DIM = 576
 FLASHMLA_V_DIM = 512
 FLASHMLA_BLOCK_SIZE = 128
+FLASHMLA_SUPPORTED_BLOCK_SIZES = tuple(range(FLASHMLA_BLOCK_SIZE, 1024 + 1, FLASHMLA_BLOCK_SIZE))
 FLASHMLA_MASK_SIZE = 2048
 FLASHMLA_MAX_BATCH_SIZE = 65535
 
@@ -101,6 +102,7 @@ class FlashMLAConfig:
     cp_world: int = 1
     cp_rank: int = 0
     cp_kv_cache_interleave_size: int = FLASHMLA_BLOCK_SIZE
+    cache_block_size: int = FLASHMLA_BLOCK_SIZE
 
     def __post_init__(self) -> None:
         # The operator's paged cache is laid out for a fixed set of Q head-group
@@ -111,6 +113,8 @@ class FlashMLAConfig:
             raise ValueError("FlashMLA mask_mode must be 0, 3 or 4")
         if self.layout_kv != "PA_BBND":
             raise ValueError("FlashMLA layout_kv must be PA_BBND")
+        if self.cache_block_size not in FLASHMLA_SUPPORTED_BLOCK_SIZES:
+            raise ValueError(f"FlashMLA cache block size must be in {FLASHMLA_SUPPORTED_BLOCK_SIZES}")
         if self.mask_mode != 4 and (self.win_left != -1 or self.win_right != -1):
             # Only the bounded sliding window carries non-default edges, and both
             # operators must receive identical values.
@@ -119,14 +123,18 @@ class FlashMLAConfig:
             raise ValueError("FlashMLA win_left/win_right must be -1 or non-negative")
         if self.enable_dcp:
             # DCP owns the mask through the metadata, so no external mask or
-            # window may be passed, and the interleave size must equal the
-            # physical block so the local slice matches the paged layout.
+            # window may be passed. The kernel validates that the metadata's
+            # interleave equals the physical reader page, including 512/896.
             if self.mask_mode != 0 or self.win_left != -1 or self.win_right != -1:
                 raise ValueError("FlashMLA DCP requires mask_mode=0 and unbounded windows")
             if self.cp_world <= 0:
                 raise ValueError("FlashMLA DCP requires cp_world >= 1")
             if not 0 <= self.cp_rank < self.cp_world:
                 raise ValueError("FlashMLA cp_rank must be a 0-based value below cp_world")
+            if self.cp_kv_cache_interleave_size != self.cache_block_size:
+                raise ValueError("FlashMLA DCP interleave must equal the physical cache block size")
+        elif self.cp_world != 1 or self.cp_rank != 0 or self.cp_kv_cache_interleave_size != FLASHMLA_BLOCK_SIZE:
+            raise ValueError("FlashMLA disabled DCP requires world=1, rank=0 and interleave=128")
 
 
 def _check_tensor(name: str, tensor: torch.Tensor, shape: tuple[int, ...], dtype: torch.dtype) -> None:
@@ -291,7 +299,7 @@ class FlashMLAImpl:
             raise ValueError("FlashMLA q must be nonempty TND with configured local heads and head dimension 576")
         if q.dtype not in (torch.bfloat16, torch.float16):
             raise ValueError("FlashMLA q must be BF16 or FP16")
-        cache_tail = (FLASHMLA_BLOCK_SIZE, 1, FLASHMLA_QK_DIM)
+        cache_tail = (self.config.cache_block_size, 1, FLASHMLA_QK_DIM)
         if k_cache.ndim != len(cache_tail) + 1 or k_cache.shape[1:] != cache_tail or k_cache.shape[0] == 0:
             raise ValueError(f"FlashMLA {self.config.layout_kv} cache must have shape (pages, {cache_tail})")
         if k_cache.dtype != q.dtype:
@@ -333,7 +341,15 @@ class FlashMLADecode:
 
 
 class FlashMLAMetadataBuilder:
-    def __init__(self, impl, device: torch.device, max_num_reqs: int, attn_mask: torch.Tensor):
+    def __init__(
+        self,
+        impl,
+        device: torch.device,
+        max_num_reqs: int,
+        attn_mask: torch.Tensor,
+        *,
+        cache_block_size: int = FLASHMLA_BLOCK_SIZE,
+    ):
         self.dcp_size = getattr(impl, "dcp_size", 1)
         self.dcp_rank = getattr(impl, "dcp_rank", 0)
         # Materialize once: an integer rank would trigger a blocking H2D copy
@@ -363,6 +379,7 @@ class FlashMLAMetadataBuilder:
                 cp_world=self.dcp_size if dcp else 1,
                 cp_rank=self.dcp_rank if dcp else 0,
                 cp_kv_cache_interleave_size=self.cp_interleave,
+                cache_block_size=cache_block_size,
             )
         )
         # Noncausal queries attend the complete local shard without the
@@ -370,7 +387,14 @@ class FlashMLAMetadataBuilder:
         # and merges local outputs/LSE with the real group size.
         noncausal_adapter = replace(
             adapter,
-            config=replace(adapter.config, mask_mode=0, enable_dcp=False, cp_world=1, cp_rank=0),
+            config=replace(
+                adapter.config,
+                mask_mode=0,
+                enable_dcp=False,
+                cp_world=1,
+                cp_rank=0,
+                cp_kv_cache_interleave_size=FLASHMLA_BLOCK_SIZE,
+            ),
         )
         self.adapters = {True: adapter, False: noncausal_adapter}
         self.device = device

@@ -18,8 +18,9 @@ from vllm_ascend.device.hardware_profile import HardwareCapability
 def test_flashmla_selection_requires_operator_and_supported_mla_config(monkeypatch):
     config = SimpleNamespace(
         use_v2_model_runner=True,
+        cache_config=SimpleNamespace(block_size=128),
         speculative_config=None,
-        parallel_config=SimpleNamespace(decode_context_parallel_size=1),
+        parallel_config=SimpleNamespace(decode_context_parallel_size=1, cp_kv_cache_interleave_size=128),
     )
     impl = SimpleNamespace(
         vllm_config=config,

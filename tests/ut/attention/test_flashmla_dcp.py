@@ -91,8 +91,8 @@ def paged_attention(query, cache, **kwargs):
         if not length or not qlen:
             continue
         indices = torch.arange(length)
-        blocks = kwargs["block_table"][request, indices // 128].long()
-        keys = cache[blocks, indices % 128, 0].double()
+        blocks = kwargs["block_table"][request, indices // cache.shape[1]].long()
+        keys = cache[blocks, indices % cache.shape[1], 0].double()
         global_positions = (indices // plan.interleave * plan.world + plan.rank) * plan.interleave
         global_positions += indices % plan.interleave
         for offset in range(qlen):
@@ -209,6 +209,11 @@ def runtime(monkeypatch):
         **kwargs,
     ):
         assert (casusal_seqlens_kv_global is not None) == enable_dcp
+        if enable_dcp:
+            assert 128 <= cp_kv_cache_interleave_size <= 1024
+            assert cp_kv_cache_interleave_size % 128 == 0
+        else:
+            assert (cp_world, cp_rank, cp_kv_cache_interleave_size) == (1, 0, 128)
         header = lengths.new_zeros(5)
         for index, value in enumerate((num_heads_q, enable_dcp, cp_world, cp_rank, cp_kv_cache_interleave_size)):
             header[index] = int(value)
@@ -228,7 +233,7 @@ def runtime(monkeypatch):
         classmethod(lambda cls, config: cls(config, attention_op, metadata_op)),
     )
 
-    def builder(*, size=8, rank=0, interleave=1, heads=8, dtype=torch.float16, use_rope=False, speculative=True):
+    def builder(*, size=8, rank=0, interleave=128, heads=8, dtype=torch.float16, use_rope=False, speculative=True):
         impl = SimpleNamespace(
             num_heads=heads,
             scale=0.125,
@@ -242,7 +247,11 @@ def runtime(monkeypatch):
             ),
         )
         return api.FlashMLAMetadataBuilder(
-            impl, torch.device("cpu"), 8, torch.triu(torch.ones(2048, 2048, dtype=torch.int8), diagonal=1)
+            impl,
+            torch.device("cpu"),
+            8,
+            torch.triu(torch.ones(2048, 2048, dtype=torch.int8), diagonal=1),
+            cache_block_size=interleave,
         )
 
     class AttentionKind(Enum):
@@ -325,12 +334,12 @@ def common(lengths, queries, *, tokens=None, causal=True):
 @pytest.mark.parametrize(
     "causal,speculative,interleave,rank",
     [
-        (True, True, 1, 0),
-        (True, True, 4, 1),
+        (True, True, 512, 0),
+        (True, True, 896, 1),
         (True, True, 128, 7),
-        (True, False, 4, 1),
+        (True, False, 768, 1),
         (False, True, 128, 7),
-        (False, False, 1, 0),
+        (False, False, 896, 0),
     ],
 )
 def test_metadata_uses_full_local_lengths_in_both_causal_modes(runtime, causal, speculative, interleave, rank):
@@ -366,7 +375,7 @@ def addresses(flash):
 
 @pytest.mark.parametrize("causal,rank", [(True, 3), (False, 7)])
 def test_metadata_refresh_reuses_device_rank(runtime, monkeypatch, causal, rank):
-    builder = runtime.builder(rank=rank, interleave=4)
+    builder = runtime.builder(rank=rank, interleave=512)
     rank_tensors = []
 
     def partition(lengths, *, dcp_size, dcp_rank, cp_kv_cache_interleave_size):
@@ -392,7 +401,7 @@ def test_metadata_refresh_reuses_device_rank(runtime, monkeypatch, causal, rank)
         with monkeypatch.context() as guard:
             guard.setattr(torch, "tensor", Mock(side_effect=AssertionError("tensor construction during refresh")))
             flash = builder.build(inputs, 2, 4, False, retain_for_graph=True)
-        expected = [sum(token // 4 % 8 == rank for token in range(length)) for length in lengths]
+        expected = [sum(token // 512 % 8 == rank for token in range(length)) for length in lengths]
         assert flash.cache_lens[:2].tolist() == expected
     assert len(rank_tensors) == 3
     assert all(tensor is rank_tensors[0] for tensor in rank_tensors)
@@ -420,7 +429,7 @@ def test_single_token_replay_keeps_one_schedule_and_buffer_addresses(runtime, mo
         same = builder.build(inputs, 2, 2, False)
 
     assert same is flash
-    expected_length = sum(token % 8 == rank for token in range(17))
+    expected_length = sum(token // 128 % 8 == rank for token in range(17))
     assert flash.cache_lens.tolist() == [expected_length, 0, 0, 0, 0]
     assert flash.used_q.tolist() == [1, 0, 0, 0, 0]
     assert flash.token_live.tolist() == [True, False, False, False]
@@ -465,12 +474,12 @@ def test_dcp_one_keeps_original_single_attention_contract(runtime, causal):
 @pytest.mark.parametrize(
     "causal,speculative,interleave,dtype,capturing,local_heads",
     [
-        (True, False, 1, torch.float16, False, 8),
+        (True, False, 512, torch.float16, False, 8),
         (True, False, 128, torch.bfloat16, True, 8),
-        (True, True, 4, torch.float16, False, 8),
+        (True, True, 896, torch.float16, False, 8),
         (True, True, 128, torch.bfloat16, True, 8),
-        (False, True, 1, torch.bfloat16, False, 8),
-        (False, True, 4, torch.float16, True, 8),
+        (False, True, 768, torch.bfloat16, False, 8),
+        (False, True, 896, torch.float16, True, 8),
         (True, True, 128, torch.bfloat16, False, 12),
         (False, True, 128, torch.bfloat16, True, 12),
     ],
@@ -482,7 +491,7 @@ def test_forward_matches_dense_with_strided_history_and_empty_ranks(
     torch.manual_seed(41)
     size, tokens = 8, 5
     queries = [3, 1] if speculative else [1, 1]
-    histories = [257, 0]
+    histories = [2 * interleave - 2, 0]
     lengths = [history + query for history, query in zip(histories, queries)]
     keys = [torch.randn(length, 576, dtype=dtype) * 0.2 for length in lengths]
     query = torch.randn(tokens, size * local_heads, 576, dtype=dtype) * 0.2
@@ -495,15 +504,15 @@ def test_forward_matches_dense_with_strided_history_and_empty_ranks(
         inputs.block_table_tensor.copy_(torch.tensor([[1, 3, 5], [2, 4, 6]]))
         flash = builder.build(inputs, 2, sum(queries), False)
         # Nonzero storage offset and padding between physical pages.
-        stride = 128 * 576 + 32
+        stride = interleave * 576 + 32
         backing = torch.full((8 * stride + 64,), 17.0, dtype=dtype)
-        cache = backing.as_strided((8, 128, 1, 576), (stride, 576, 576, 1), 32)
+        cache = backing.as_strided((8, interleave, 1, 576), (stride, 576, 576, 1), 32)
         for request, sequence in enumerate(keys):
             owners = torch.arange(sequence.shape[0]) // interleave % size
             local = sequence[owners == rank]
             for index, row in enumerate(local):
-                block = int(inputs.block_table_tensor[request, index // 128])
-                cache[block, index % 128, 0].copy_(row)
+                block = int(inputs.block_table_tensor[request, index // interleave])
+                cache[block, index % interleave, 0].copy_(row)
         flash.query.copy_(query)
         partials.append(
             flash.adapter.attention(
@@ -719,13 +728,55 @@ def test_causal_target_and_noncausal_draft_preserve_different_visibility(runtime
         torch.testing.assert_close(lse, visible_lengths.log().expand(96, -1))
 
 
+@pytest.mark.parametrize("block_size", [512, 896])
+@pytest.mark.parametrize("rank", range(4))
+def test_128k_example_keeps_partial_last_page_out_of_lengths(runtime, block_size, rank):
+    global_length = 128 * 1024
+    builder = runtime.builder(size=4, rank=rank, heads=24, interleave=block_size)
+    flash = builder.build(common([global_length], [8]), 1, 8, False)
+    expected = sum(
+        min(block_size, global_length - block * block_size)
+        for block in range(rank, (global_length + block_size - 1) // block_size, 4)
+    )
+    assert flash.cache_lens[0] == expected
+    assert flash.global_cache_lens[0] == global_length
+    plan = check_schedule(flash)
+    assert (plan.heads, plan.world, plan.rank, plan.interleave) == (96, 4, rank, block_size)
+
+
+@pytest.mark.parametrize("block_size", [512, 768, 896])
+def test_config_rejects_metadata_page_mismatch(runtime, block_size):
+    with pytest.raises(ValueError, match="interleave must equal"):
+        runtime.api.FlashMLAConfig(
+            96,
+            0.125,
+            mask_mode=0,
+            enable_dcp=True,
+            cp_world=8,
+            cp_kv_cache_interleave_size=128,
+            cache_block_size=block_size,
+        )
+    with pytest.raises(ValueError, match="disabled DCP"):
+        runtime.api.FlashMLAConfig(
+            96, 0.125, mask_mode=0, cp_kv_cache_interleave_size=block_size, cache_block_size=block_size
+        )
+
+
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("rank", range(8))
-def test_dcp8_rejection_refresh_ignores_optimistic_cpu_lengths(runtime, monkeypatch, causal, rank):
-    builder = runtime.builder(rank=rank, interleave=768)
+@pytest.mark.parametrize("interleave", [128, 512, 768, 896])
+def test_dcp8_rejection_refresh_ignores_optimistic_cpu_lengths(runtime, monkeypatch, causal, rank, interleave):
+    builder = runtime.builder(rank=rank, interleave=interleave)
     # Cover an interleave boundary and a complete eight-rank stripe. The last
     # row is idle graph padding with a nonzero query extent and zero length.
-    history_lengths = [767, 768, 769, 6143, 6144, 6145]
+    history_lengths = [
+        interleave - 1,
+        interleave,
+        interleave + 1,
+        8 * interleave - 1,
+        8 * interleave,
+        8 * interleave + 1,
+    ]
     upper_bounds = [length + 4 for length in history_lengths] + [0]
     inputs = common(upper_bounds, [4] * 7, tokens=32, causal=causal)
     inputs.block_table_tensor = torch.arange(16, dtype=torch.int32).expand(7, -1).clone()
@@ -746,7 +797,7 @@ def test_dcp8_rejection_refresh_ignores_optimistic_cpu_lengths(runtime, monkeypa
             same = builder.build(inputs, 7, 28, False)
         assert same is flash
         assert addresses(flash) == pointers
-        expected = [sum(token // 768 % 8 == rank for token in range(length)) for length in exact[:-1]]
+        expected = [sum(token // interleave % 8 == rank for token in range(length)) for length in exact[:-1]]
         assert flash.cache_lens[:7].tolist() == expected + [0]
         assert not flash.cache_lens[7:].any()
         assert flash.used_q[:7].tolist() == [4] * 6 + [0]
