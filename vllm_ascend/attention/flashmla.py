@@ -3,7 +3,7 @@
 """External, unquantized FlashMLA implementation and metadata builder.
 
 Call FlashMLAImpl.load after selecting the worker device. Importing this module
-does not load cann_ops_transformer_custom. FlashMLAImpl wraps the operator contract, while
+does not load cann_ops_transformer. FlashMLAImpl wraps the operator contract, while
 FlashMLAMetadataBuilder owns per-batch inputs, stable buffers and per-build refreshes.
 Callers own stream ordering and persistent KV writes. Tensor-content checks belong
 in preflight tests: the decode hot path must not copy lengths or tables to the CPU.
@@ -185,8 +185,8 @@ class FlashMLAImpl:
         available_ops = get_flashmla_ops()
         if available_ops is None:
             raise RuntimeError(
-                "FlashMLA requires cann_ops_transformer_custom to register "
-                "torch.ops.cann_ops_transformer.flash_mla and flash_mla_metadata. "
+                "FlashMLA requires cann_ops_transformer.ops.flash_mla "
+                "and cann_ops_transformer.ops.flash_mla_metadata. "
                 "Install a DCP-capable package matching the worker's "
                 "CANN and torch_npu versions."
             )

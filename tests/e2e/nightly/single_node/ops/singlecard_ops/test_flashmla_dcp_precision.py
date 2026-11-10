@@ -3,7 +3,8 @@
 """Run real BF16/FP16 FlashMLA shards on one NPU and check a dense CPU reference.
 
 This follows dcp.py's sequential-rank method. It checks the installed kernel,
-not HCCL or multi-process serving. Run after sourcing the custom CANN package.
+not HCCL or multi-process serving. Run with the DCP-capable cann_ops_transformer
+package after sourcing its CANN environment.
 """
 
 import math
@@ -13,7 +14,7 @@ import pytest
 
 torch = pytest.importorskip("torch")
 pytest.importorskip("torch_npu")
-pytest.importorskip("cann_ops_transformer_custom")
+pytest.importorskip("cann_ops_transformer")
 
 from vllm_ascend.attention.flashmla import FlashMLAConfig, FlashMLAImpl  # noqa: E402
 from vllm_ascend.device.device_op import DeviceOperator  # noqa: E402
@@ -103,7 +104,7 @@ def _merge(partials):
 @torch.inference_mode()
 def test_custom_flashmla_dcp_matches_dense(world, dtype, causal, strided, block_size):
     if not torch.npu.is_available():
-        pytest.skip("requires an NPU and the DCP-capable custom extension")
+        pytest.skip("requires an NPU and the DCP-capable cann_ops_transformer package")
     torch.npu.set_device(0)
     device = torch.device("npu:0")
     generator = torch.Generator().manual_seed(42)

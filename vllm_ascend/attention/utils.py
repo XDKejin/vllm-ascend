@@ -88,29 +88,29 @@ def supports_strided_mla_cache(
 
 @lru_cache(maxsize=1)
 def _has_flashmla_module() -> bool:
-    """Whether the DCP-capable FlashMLA registration extension is discoverable."""
-    return find_spec("cann_ops_transformer_custom") is not None
+    """Whether the default CANN ops-transformer package is discoverable."""
+    return find_spec("cann_ops_transformer") is not None
 
 
 def get_flashmla_ops() -> tuple[Callable, Callable] | None:
-    """Load the BF16/FP16 dispatcher APIs used by the DCP reference.
+    """Load the BF16/FP16 APIs exported by cann_ops_transformer.ops.
 
-    Import only after selecting the worker device. The custom extension
-    registers into torch.ops.cann_ops_transformer; its Python module is not
-    the operator namespace. An absent extension permits FIA selection before
-    cache allocation. An installed but incompatible extension is an error.
+    Import only after selecting the worker device. The default package owns
+    registration and entry-point overrides; do not require a separate custom
+    distribution or bypass its public exports with an unrelated dispatcher
+    handle. An absent package permits FIA selection before cache allocation.
+    An installed but incompatible package is an error.
     """
     if not _has_flashmla_module():
         return None
 
     try:
-        import_module("cann_ops_transformer_custom")
+        namespace = import_module("cann_ops_transformer.ops")
     except ModuleNotFoundError as exc:
-        if exc.name == "cann_ops_transformer_custom":
+        if exc.name == "cann_ops_transformer":
             return None
         raise
 
-    namespace = torch.ops.cann_ops_transformer
     required_args = {
         "flash_mla": {
             "block_table",
@@ -153,12 +153,10 @@ def get_flashmla_ops() -> tuple[Callable, Callable] | None:
         operator = getattr(packet, "default", None)
         schema = getattr(operator, "_schema", None)
         if not callable(operator) or schema is None:
-            raise RuntimeError(f"cann_ops_transformer_custom must register torch.ops.cann_ops_transformer.{name}")
+            raise RuntimeError(f"cann_ops_transformer.ops must export the registered {name} operator")
         missing = required - {argument.name for argument in schema.arguments}
         if missing:
-            raise RuntimeError(
-                f"FlashMLA custom extension has an incompatible {name} schema; missing {sorted(missing)}"
-            )
+            raise RuntimeError(f"cann_ops_transformer has an incompatible {name} schema; missing {sorted(missing)}")
         operators.append(operator)
     return operators[0], operators[1]
 

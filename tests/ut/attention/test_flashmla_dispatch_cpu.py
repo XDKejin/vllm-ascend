@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Check the custom extension's dispatcher contract without NPU dependencies."""
+"""Check the default CANN package exports without NPU dependencies."""
 
 import ast
 from collections.abc import Callable
@@ -62,48 +62,69 @@ def registered_ops(metadata_schema=METADATA_SCHEMA):
     )
 
 
-def test_custom_extension_absent_skips_import_and_operator_lookup(loader):
+def test_default_package_absent_skips_import_and_operator_lookup(loader):
     loader.find_spec.return_value = None
     assert loader.get_flashmla_ops() is None
-    loader.find_spec.assert_called_once_with("cann_ops_transformer_custom")
+    loader.find_spec.assert_called_once_with("cann_ops_transformer")
     loader.import_module.assert_not_called()
 
 
-def test_custom_extension_registers_ops_in_cann_namespace(loader):
-    namespace = loader.torch.ops.cann_ops_transformer
+def test_default_package_does_not_require_custom_distribution(loader):
+    loader.find_spec.side_effect = lambda name: object() if name == "cann_ops_transformer" else None
+    namespace = registered_ops()
+    loader.import_module.return_value = namespace
+    assert loader.get_flashmla_ops() == (namespace.flash_mla.default, namespace.flash_mla_metadata.default)
+    loader.find_spec.assert_called_once_with("cann_ops_transformer")
+    loader.import_module.assert_called_once_with("cann_ops_transformer.ops")
+
+
+def test_default_package_public_exports_are_used(loader):
+    namespace = registered_ops()
+    # A dispatcher handle from another import must not override the exports
+    # selected by the default package (including its entry-point policy).
+    loader.torch.ops.cann_ops_transformer = registered_ops()
 
     def register(name):
-        assert name == "cann_ops_transformer_custom"
-        namespace.__dict__.update(vars(registered_ops()))
-        # Exports from the registration module are deliberately irrelevant.
-        return SimpleNamespace(flash_mla=Mock(), flash_mla_metadata=Mock())
+        assert name == "cann_ops_transformer.ops"
+        return namespace
 
     loader.import_module.side_effect = register
     attention, metadata = loader.get_flashmla_ops()
     assert attention is namespace.flash_mla.default
     assert metadata is namespace.flash_mla_metadata.default
-    loader.import_module.assert_called_once_with("cann_ops_transformer_custom")
+    loader.import_module.assert_called_once_with("cann_ops_transformer.ops")
 
 
-def test_custom_extension_missing_during_import_returns_none(loader):
-    loader.import_module.side_effect = ModuleNotFoundError(
-        "missing custom extension", name="cann_ops_transformer_custom"
-    )
+def test_default_package_missing_during_import_returns_none(loader):
+    loader.import_module.side_effect = ModuleNotFoundError("missing default package", name="cann_ops_transformer")
     assert loader.get_flashmla_ops() is None
 
 
-def test_custom_extension_internal_import_failure_is_not_hidden(loader):
+def test_default_package_internal_import_failure_is_not_hidden(loader):
     loader.import_module.side_effect = ModuleNotFoundError("missing internal_dependency", name="internal_dependency")
     with pytest.raises(ModuleNotFoundError, match="internal_dependency"):
         loader.get_flashmla_ops()
 
 
+def test_installed_package_missing_ops_module_is_not_silently_disabled(loader):
+    loader.import_module.side_effect = ModuleNotFoundError("missing ops module", name="cann_ops_transformer.ops")
+    with pytest.raises(ModuleNotFoundError, match="missing ops module"):
+        loader.get_flashmla_ops()
+
+
+def test_incompatible_package_exports_do_not_use_stale_dispatcher(loader):
+    loader.torch.ops.cann_ops_transformer = registered_ops()
+    loader.import_module.return_value = SimpleNamespace()
+    with pytest.raises(RuntimeError, match="must export.*flash_mla"):
+        loader.get_flashmla_ops()
+
+
 @pytest.mark.parametrize("missing", ["flash_mla", "flash_mla_metadata"])
-def test_installed_extension_requires_both_registered_operators(loader, missing):
+def test_installed_package_requires_both_exported_operators(loader, missing):
     namespace = registered_ops()
     delattr(namespace, missing)
-    loader.torch.ops.cann_ops_transformer = namespace
-    with pytest.raises(RuntimeError, match=f"must register.*{missing}"):
+    loader.import_module.return_value = namespace
+    with pytest.raises(RuntimeError, match=f"must export.*{missing}"):
         loader.get_flashmla_ops()
 
 
@@ -114,7 +135,7 @@ def test_rejects_old_metadata_schema_before_cache_allocation(loader, argument):
     namespace.flash_mla_metadata.default._schema = SimpleNamespace(
         arguments=[item for item in schema.arguments if item.name != argument]
     )
-    loader.torch.ops.cann_ops_transformer = namespace
+    loader.import_module.return_value = namespace
     with pytest.raises(RuntimeError, match=f"incompatible flash_mla_metadata.*{argument}"):
         loader.get_flashmla_ops()
 
@@ -122,6 +143,6 @@ def test_rejects_old_metadata_schema_before_cache_allocation(loader, argument):
 def test_rejects_incompatible_attention_schema(loader):
     namespace = registered_ops()
     namespace.flash_mla.default._schema = torch._C.parse_schema("flash_mla(Tensor q, Tensor k_cache) -> Tensor")
-    loader.torch.ops.cann_ops_transformer = namespace
+    loader.import_module.return_value = namespace
     with pytest.raises(RuntimeError, match="incompatible flash_mla schema"):
         loader.get_flashmla_ops()
